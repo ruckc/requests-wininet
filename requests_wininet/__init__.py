@@ -1,6 +1,8 @@
 import ctypes
+import gzip
 import logging
 import urllib.parse
+import zlib
 from ctypes import wintypes
 from typing import Tuple
 
@@ -149,8 +151,13 @@ class WinINetAdapter(BaseAdapter):
         while i < len(data):
             j = data.find(b"\r\n", i)
             if j == -1:
-                break
-            chunk_size = int(data[i:j], 16)
+                # Not a valid chunked encoding, return original data
+                return data
+            try:
+                chunk_size = int(data[i:j], 16)
+            except ValueError:
+                # Not a valid chunk size, return original data
+                return data
             if chunk_size == 0:
                 break
             i = j + 2
@@ -258,6 +265,25 @@ class WinINetAdapter(BaseAdapter):
         )
         return response
 
+    def _decode_content(self, content, transfer_encoding, content_encoding):
+        """Decompress and/or dechunk content as needed."""
+        if content_encoding == "gzip":
+            try:
+                content = gzip.decompress(content)
+                logger.debug("Decompressed gzip response")
+            except Exception as e:
+                logger.warning(f"Failed to decompress gzip: {e}")
+        elif content_encoding == "deflate":
+            try:
+                content = zlib.decompress(content)
+                logger.debug("Decompressed deflate response")
+            except Exception as e:
+                logger.warning(f"Failed to decompress deflate: {e}")
+        elif "chunked" in transfer_encoding:
+            content = self._dechunk(content)
+            logger.debug(f"Dechunked response to {len(content)} bytes")
+        return content
+
     def send(
         self,
         request: PreparedRequest,
@@ -302,9 +328,8 @@ class WinINetAdapter(BaseAdapter):
         content = self._read_content(hRequest)
         logger.debug(f"Read {len(content)} bytes from response")
         transfer_encoding = parsed_headers.get("Transfer-Encoding", "").lower()
-        if "chunked" in transfer_encoding:
-            content = self._dechunk(content)
-            logger.debug(f"Dechunked response to {len(content)} bytes")
+        content_encoding = parsed_headers.get("Content-Encoding", "").lower()
+        content = self._decode_content(content, transfer_encoding, content_encoding)
         wininet.InternetCloseHandle(hRequest)
         wininet.InternetCloseHandle(hConnect)
         wininet.InternetCloseHandle(hInternet)

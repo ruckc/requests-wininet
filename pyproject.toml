@@ -1,6 +1,6 @@
 [project]
 name = "requests-wininet"
-version = "0.1.1"
+version = "0.1.2"
 description = "Implements Window's WinINet API for python requests"
 authors = [
     {name = "Curtis Ruck",email = "ruckc@users.github.com"}
