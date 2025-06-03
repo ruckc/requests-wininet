@@ -11,7 +11,7 @@ on:
 
 jobs:
   build-and-publish:
-    runs-on: ubuntu-latest
+    runs-on: windows-latest
     permissions:
       contents: write
     steps:
@@ -33,3 +33,10 @@ jobs:
 
       - name: Build package
         run: poetry build
+
+      - name: Run tests and coverage
+        run: |
+          poetry run coverage run -m pytest
+          poetry run coverage xml
+          poetry run coverage json
+          poetry run coverage lcov
