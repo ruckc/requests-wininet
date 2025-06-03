@@ -306,3 +306,72 @@ def test_connection_error_wininet_adapter():
     session.mount("http://", WinINetAdapter())
     with pytest.raises((requests.exceptions.ConnectionError, OSError)):
         session.get("http://localhost:65534", timeout=0.1)
+
+
+def test_connection_refused_wininet_adapter():
+    session = requests.Session()
+    session.mount("http://", WinINetAdapter())
+    # Use a port that is not open (should be refused)
+    with pytest.raises((requests.exceptions.ConnectionError, OSError)):
+        session.get("http://localhost:9", timeout=0.5)
+
+
+def test_invalid_dns_wininet_adapter():
+    session = requests.Session()
+    session.mount("http://", WinINetAdapter())
+    # Use an invalid domain name
+    with pytest.raises((requests.exceptions.ConnectionError, OSError)):
+        session.get("http://nonexistentdomain1234567890.com", timeout=0.5)
+
+
+def test_too_large_request_header_wininet_adapter(start_server):
+    session = requests.Session()
+    session.mount("http://", WinINetAdapter())
+    # Create a header that exceeds 16KB
+    large_header = {"X-Large-Header": "A" * (17 * 1024)}
+    resp = session.get(f"http://localhost:{start_server}/", headers=large_header)
+    # WinINet may silently truncate or accept large headers, so check the header on the server side if possible
+    # Here, just assert the request did not raise and got a valid response
+    assert resp.status_code == 200
+    assert b"Hello, world!" in resp.content
+
+
+def test_too_large_response_header_wininet_adapter(monkeypatch, start_server):
+    # Patch the Handler to send a huge response header
+    session = requests.Session()
+    session.mount("http://", WinINetAdapter())
+    class HugeHeaderHandler(http.server.SimpleHTTPRequestHandler):
+        def do_GET(self):
+            self.send_response(200)
+            self.send_header("X-Huge-Header", "A" * (17 * 1024))
+            self.end_headers()
+            self.wfile.write(b"OK")
+    def run_huge_header_server(port):
+        with socketserver.TCPServer(("", port), HugeHeaderHandler) as httpd:
+            httpd.serve_forever()
+    # Start a new server on a different port
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.bind(("localhost", 0))
+        huge_port = s.getsockname()[1]
+    server_thread = threading.Thread(target=run_huge_header_server, args=(huge_port,), daemon=True)
+    server_thread.start()
+    time.sleep(0.25)
+    resp = session.get(f"http://localhost:{huge_port}/")
+    # WinINet may truncate or drop the header, but the request should succeed
+    assert resp.status_code == 200
+    assert b"OK" in resp.content
+
+
+@pytest.mark.parametrize(
+    "timeout",
+    [
+        (0.001, None),         # tuple (float, None)
+        (0.001, 0.002),        # tuple (float, float)
+        (0.001,),              # tuple of length 1
+    ]
+)
+def test_timeout_tuple_variations_wininet_adapter(timeout):
+    session = requests.Session()
+    session.mount("http://", WinINetAdapter())
+    with pytest.raises((requests.exceptions.ConnectTimeout, requests.exceptions.ConnectionError, OSError)):
+        session.get("http://localhost", timeout=timeout)

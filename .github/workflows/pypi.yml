@@ -26,8 +26,26 @@ jobs:
       - name: Install dependencies
         run: poetry install --no-root
 
+      - name: Build package
+        run: poetry build
+
+      - name: Run tests and coverage
+        run: |
+          poetry run coverage run -m pytest
+          poetry run coverage xml
+          poetry run coverage json
+          poetry run coverage lcov
+
+
+      - name: Attach package to release
+        uses: softprops/action-gh-release@v1
+        with:
+          files: dist/*.whl, dist/*.tar.gz, coverage.*
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
       - name: Publish to PyPI
         env:
           POETRY_PYPI_TOKEN_PYPI: ${{ secrets.PYPI_TOKEN }}
         run: |
-          poetry publish --build
+          poetry publish

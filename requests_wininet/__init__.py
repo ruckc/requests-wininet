@@ -4,6 +4,7 @@ import urllib.parse
 from ctypes import wintypes
 from typing import Tuple
 
+import requests
 from requests.adapters import BaseAdapter
 from requests.models import PreparedRequest, Response
 from requests.structures import CaseInsensitiveDict
@@ -13,7 +14,12 @@ INTERNET_OPEN_TYPE_PRECONFIG = 0
 INTERNET_FLAG_RELOAD = 0x80000000
 INTERNET_FLAG_NO_CACHE_WRITE = 0x04000000
 
+INTERNET_ERROR_BASE = 12000
+ERROR_INTERNET_CLIENT_AUTH_CERT_NEEDED = 12044
+FLAGS_IE_DIALOG = 0x00000001  # IE_INTERNETDIALOG_FLAGS_GENERATE_DATA
+
 wininet = ctypes.windll.wininet
+kernel32 = ctypes.windll.kernel32
 
 logger = logging.getLogger("requests_wininet.WinINetAdapter")
 
@@ -21,7 +27,18 @@ logger = logging.getLogger("requests_wininet.WinINetAdapter")
 class WinINetAdapter(BaseAdapter):
     """A transport adapter for requests using WinINet."""
 
-    max_header_size = 16 * 1024  # 16KB default, can be changed per instance
+    max_header_size: int
+    _hWnd: int
+
+    def __init__(self, hWnd: int = 0, max_header_size: int = 16 * 1024):
+        """
+        Initialize the WinINetAdapter.
+
+        :param hWnd: Optional handle to a window for displaying dialogs.
+        """
+        super().__init__()
+        self._hWnd = hWnd
+        self.max_header_size = max_header_size
 
     def _get_status_code(self, hRequest) -> int:
         """Helper to get the HTTP status code from a WinINet request handle."""
@@ -176,28 +193,49 @@ class WinINetAdapter(BaseAdapter):
             0,
         )
         if not hRequest:
+            errno = kernel32.GetLastError()
             wininet.InternetCloseHandle(hConnect)
-            raise OSError("HttpOpenRequestW failed")
+            raise requests.exceptions.ConnectionError(f"HttpOpenRequestW failed: {errno}")
         return hRequest
 
     def _send_request(self, hRequest, headers, body, body_len, hConnect, hInternet):
         if not wininet.HttpSendRequestW(hRequest, headers, len(headers), body, body_len):
-            wininet.InternetCloseHandle(hRequest)
-            wininet.InternetCloseHandle(hConnect)
-            wininet.InternetCloseHandle(hInternet)
-            raise OSError("HttpSendRequestW failed")
+            return self._handle_send_failure(hRequest, hConnect, hInternet, headers, body, hConnect, hInternet)
+        return
+
+    def _handle_send_failure(self, hRequest, method, path, req_headers, send_data, hConnect, hInternet):
+        error = kernel32.GetLastError()
+        if error == ERROR_INTERNET_CLIENT_AUTH_CERT_NEEDED:
+            logger.warning(
+                f"Error 12044 (client certificate required) for {method} {path}. Prompting user with InternetErrorDlg."
+            )
+            dlg_result = wininet.InternetErrorDlg(self._hWnd, hRequest, error, FLAGS_IE_DIALOG, None)
+            if dlg_result == 0:
+                try:
+                    return self._send_request(
+                        hRequest, req_headers, send_data, len(send_data) if send_data else 0, hConnect, hInternet
+                    )
+                except requests.exceptions.SSLError:
+                    logger.error(f"Failed to send request after user dialog for {method} {path}.")
+                    raise
+            logger.error(f"User did not select a certificate or dialog failed for {method} {path}.")
+            raise requests.exceptions.SSLError(f"Client certificate required for {method} {path}, but none was provided.")
+        else:
+            raise requests.exceptions.ConnectionError(f"Failed to send request for {method} {path}. WinINet error: {error}")
 
     def _open_connection(self, hInternet, host, port):
         hConnect = wininet.InternetConnectW(hInternet, host, port, None, None, 3, 0, 0)
         if not hConnect:
+            errno = kernel32.GetLastError()
             wininet.InternetCloseHandle(hInternet)
-            raise OSError("InternetConnectW failed")
+            raise requests.exceptions.ConnectionError(f"InternetConnectW failed: {errno}")
         return hConnect
 
     def _open_internet(self, timeout):
         hInternet = wininet.InternetOpenW("PythonWinINetAdapter", INTERNET_OPEN_TYPE_PRECONFIG, None, None, 0)
         if not hInternet:
-            raise OSError("InternetOpenW failed")
+            errno = kernel32.GetLastError()
+            raise requests.exceptions.ConnectionError(f"InternetOpenW failed: {errno}")
         self._set_timeouts(hInternet, timeout)
         return hInternet
 
@@ -270,6 +308,7 @@ class WinINetAdapter(BaseAdapter):
         wininet.InternetCloseHandle(hRequest)
         wininet.InternetCloseHandle(hConnect)
         wininet.InternetCloseHandle(hInternet)
+
         def generate_content():
             logger.debug("Starting streaming response generator")
             hInternet = self._open_internet(timeout)
@@ -289,6 +328,7 @@ class WinINetAdapter(BaseAdapter):
                 wininet.InternetCloseHandle(hConnect)
                 wininet.InternetCloseHandle(hInternet)
             logger.debug("Streaming response generator finished")
+
         return self._build_response(request, status_code, reason, parsed_headers, content, stream, generate_content)
 
     def close(self):
