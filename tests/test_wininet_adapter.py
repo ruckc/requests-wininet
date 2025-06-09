@@ -37,7 +37,7 @@ def start_server():
     server_thread = threading.Thread(target=run_server, args=(port,), daemon=True)
     server_thread.start()
     time.sleep(0.25)  # Give server time to start
-    yield port
+    return port
     # No explicit shutdown needed due to daemon thread
 
 
@@ -93,7 +93,7 @@ def start_large_server():
     server_thread = threading.Thread(target=run_large_server, args=(port,), daemon=True)
     server_thread.start()
     time.sleep(0.25)
-    yield port
+    return port
     # No explicit shutdown needed
 
 
@@ -177,7 +177,7 @@ def start_error_server():
     server_thread = threading.Thread(target=run_error_server, args=(port,), daemon=True)
     server_thread.start()
     time.sleep(0.25)
-    yield port
+    return port
 
 
 # Timeout test (connection timeout)

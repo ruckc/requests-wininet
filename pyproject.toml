@@ -1,16 +1,16 @@
 [project]
 name = "requests-wininet"
-version = "0.1.3"
+version = "0.1.4"
 description = "Implements Window's WinINet API for python requests"
-authors = [
-    {name = "Curtis Ruck",email = "ruckc@users.github.com"}
-]
+authors = [{ name = "Curtis Ruck" }]
 readme = "README.md"
 requires-python = ">=3.9"
-dependencies = [
-    "requests (>=2.27.0,<3.0.0)"
-]
+dependencies = ["requests (>=2.27.0,<3.0.0)"]
 license = { text = "Apache-2.0" }
+
+[project.urls]
+Repository = "https://github.com/ruckc/requests-wininet"
+Issues = "https://github.com/ruckc/requests-wininet/issues"
 
 [build-system]
 requires = ["poetry-core>=2.0.0,<3.0.0"]
@@ -27,5 +27,61 @@ line-length = 128
 indent-width = 4
 
 [tool.ruff.lint]
-select = ["E", "F", "W", "C", "Q", "I"]
-ignore = ["W293"]
+select = [
+    "E",
+    "F",
+    "W",
+    "C",
+    "Q",
+    "I",
+    "YTT",
+    "ANN",
+    "ASYNC",
+    "S",
+    "BLE",
+    "FBT",
+    "B",
+    "A",
+    "COM",
+    "C4",
+    "EM",
+    "EXE",
+    "FIX",
+    "FA",
+    "ISC",
+    "ICN",
+    "LOG",
+    "G",
+    "INP",
+    "PIE",
+    "T20",
+    "PYI",
+    "PT",
+    "RSE",
+    "RET",
+    "SLF",
+    "SIM",
+    "SLOT",
+    "TID",
+    "TD",
+    "TC",
+    "ARG",
+    "PTH",
+    "FLY",
+    "C90",
+    "NPY",
+    "PD",
+    "N",
+    "PERF",
+    "D",
+    "PGH",
+    "PL",
+    "PLE",
+    "PLR",
+    "PLW",
+    "UP",
+    "FURB",
+    "RUF",
+    "TRY",
+]
+ignore = ["W293", "D211", "D213", "COM812", "D203"]

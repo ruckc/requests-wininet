@@ -1,10 +1,17 @@
+# __init__.py for requests_wininet
+"""Implements Window's WinINet API for python requests."""
+
+from __future__ import annotations
+
 import ctypes
 import gzip
 import logging
 import urllib.parse
 import zlib
+from collections.abc import Generator
 from ctypes import wintypes
-from typing import Tuple
+from dataclasses import dataclass
+from typing import Callable
 
 import requests
 from requests.adapters import BaseAdapter
@@ -15,10 +22,22 @@ from requests.structures import CaseInsensitiveDict
 INTERNET_OPEN_TYPE_PRECONFIG = 0
 INTERNET_FLAG_RELOAD = 0x80000000
 INTERNET_FLAG_NO_CACHE_WRITE = 0x04000000
+INTERNET_FLAG_SECURE = 0x00800000
+INTERNET_SERVICE_HTTP = 3
+INTERNET_OPTION_CONNECT_TIMEOUT = 2
+INTERNET_OPTION_RECEIVE_TIMEOUT = 6
+HTTP_QUERY_STATUS_CODE = 19
+HTTP_QUERY_RAW_HEADERS_CRLF = 22
+HTTP_QUERY_STATUS_TEXT = 20
+CHUNKED_ENCODING = "chunked"
+MAX_HEADER_SIZE = 16 * 1024
+CHUNK_SIZE = 4096
+TWO = 2
+ONE = 1
 
 INTERNET_ERROR_BASE = 12000
 ERROR_INTERNET_CLIENT_AUTH_CERT_NEEDED = 12044
-FLAGS_IE_DIALOG = 0x00000001  # IE_INTERNETDIALOG_FLAGS_GENERATE_DATA
+FLAGS_IE_DIALOG = 0x00000001
 
 wininet = ctypes.windll.wininet
 kernel32 = ctypes.windll.kernel32
@@ -26,49 +45,53 @@ kernel32 = ctypes.windll.kernel32
 logger = logging.getLogger("requests_wininet.WinINetAdapter")
 
 
+@dataclass
+class RequestHandles:
+    """Container for WinINet handles."""
+
+    h_request: int
+    h_connect: int
+    h_internet: int
+
+
 class WinINetAdapter(BaseAdapter):
     """A transport adapter for requests using WinINet."""
 
     max_header_size: int
-    _hWnd: int
+    _hwnd: int
 
-    def __init__(self, hWnd: int = 0, max_header_size: int = 16 * 1024):
-        """
-        Initialize the WinINetAdapter.
+    def __init__(self, hwnd: int = 0, max_header_size: int = MAX_HEADER_SIZE) -> None:
+        """Initialize the WinINetAdapter.
 
-        :param hWnd: Optional handle to a window for displaying dialogs.
+        :param hwnd: Optional handle to a window for displaying dialogs.
         """
         super().__init__()
-        self._hWnd = hWnd
+        self._hwnd = hwnd
         self.max_header_size = max_header_size
 
-    def _get_status_code(self, hRequest) -> int:
-        """Helper to get the HTTP status code from a WinINet request handle."""
+    def _get_status_code(self, h_request: int) -> int:
+        """Return the HTTP status code from a WinINet request handle."""
         code = wintypes.DWORD()
         size = wintypes.DWORD(ctypes.sizeof(code))
-        HTTP_QUERY_STATUS_CODE = 19
-        if wininet.HttpQueryInfoW(hRequest, HTTP_QUERY_STATUS_CODE, ctypes.byref(code), ctypes.byref(size), None):
+        if wininet.HttpQueryInfoW(h_request, HTTP_QUERY_STATUS_CODE, ctypes.byref(code), ctypes.byref(size), None):
             return code.value
-
         size = wintypes.DWORD(256)
         buf = ctypes.create_unicode_buffer(size.value)
-
-        if wininet.HttpQueryInfoW(hRequest, HTTP_QUERY_STATUS_CODE, buf, ctypes.byref(size), None):
+        if wininet.HttpQueryInfoW(h_request, HTTP_QUERY_STATUS_CODE, buf, ctypes.byref(size), None):
             try:
                 return int(buf.value)
             except ValueError:
                 pass
-
         return 0
 
-    def _prepare_headers(self, request):
+    def _prepare_headers(self, request: PreparedRequest) -> str:
         headers = ""
         if request.headers:
             for k, v in request.headers.items():
                 headers += f"{k}: {v}\r\n"
         return headers
 
-    def _prepare_body(self, request):
+    def _prepare_body(self, request: PreparedRequest) -> tuple[bytes | None, int]:
         body = request.body
         if body is not None:
             if isinstance(body, str):
@@ -78,16 +101,15 @@ class WinINetAdapter(BaseAdapter):
             body_len = 0
         return body, body_len
 
-    def _parse_headers(self, hRequest):
-        HTTP_QUERY_RAW_HEADERS_CRLF = 22
+    def _parse_headers(self, h_request: int) -> dict:
         parsed_headers = {}
         buf_size = 4096
-        max_size = getattr(self, "max_header_size", 16 * 1024)
+        max_size = getattr(self, "max_header_size", MAX_HEADER_SIZE)
         while buf_size <= max_size:
             headers_buf = ctypes.create_unicode_buffer(buf_size)
             headers_len = wintypes.DWORD(buf_size)
             success = wininet.HttpQueryInfoW(
-                hRequest,
+                h_request,
                 HTTP_QUERY_RAW_HEADERS_CRLF,
                 headers_buf,
                 ctypes.byref(headers_len),
@@ -104,22 +126,20 @@ class WinINetAdapter(BaseAdapter):
                         k, v = line.split(":", 1)
                         parsed_headers[k.strip()] = v.strip()
                 return parsed_headers
-            elif headers_len.value > buf_size:
+            if headers_len.value > buf_size:
                 buf_size = headers_len.value
                 continue
-            else:
-                break
+            break
         return parsed_headers
 
-    def _parse_reason(self, hRequest):
-        HTTP_QUERY_STATUS_TEXT = 20
+    def _parse_reason(self, h_request: int) -> str:
         buf_size = 128
-        max_size = getattr(self, "max_header_size", 16 * 1024)
+        max_size = getattr(self, "max_header_size", MAX_HEADER_SIZE)
         while buf_size <= max_size:
             reason_buf = ctypes.create_unicode_buffer(buf_size)
             reason_len = wintypes.DWORD(buf_size)
             success = wininet.HttpQueryInfoW(
-                hRequest,
+                h_request,
                 HTTP_QUERY_STATUS_TEXT | 0x20000000,
                 reason_buf,
                 ctypes.byref(reason_len),
@@ -127,25 +147,24 @@ class WinINetAdapter(BaseAdapter):
             )
             if success:
                 return reason_buf.value
-            elif reason_len.value > buf_size:
+            if reason_len.value > buf_size:
                 buf_size = reason_len.value
                 continue
-            else:
-                break
+            break
         return ""
 
-    def _read_content(self, hRequest):
-        buffer = ctypes.create_string_buffer(4096)
+    def _read_content(self, h_request: int) -> bytes:
+        buffer = ctypes.create_string_buffer(CHUNK_SIZE)
         bytes_read = wintypes.DWORD(0)
         content = b""
         while True:
-            success = wininet.InternetReadFile(hRequest, buffer, 4096, ctypes.byref(bytes_read))
+            success = wininet.InternetReadFile(h_request, buffer, CHUNK_SIZE, ctypes.byref(bytes_read))
             if not success or bytes_read.value == 0:
                 break
             content += buffer.raw[: bytes_read.value]
         return content
 
-    def _dechunk(self, data):
+    def _dechunk(self, data: bytes) -> bytes:
         i = 0
         out = b""
         while i < len(data):
@@ -165,18 +184,18 @@ class WinINetAdapter(BaseAdapter):
             i += chunk_size + 2  # skip chunk and trailing \r\n
         return out
 
-    def _set_timeouts(self, handle, timeout):
-        logger.debug(f"Setting timeouts: {timeout}")
+    def _set_timeouts(self, handle: int, timeout: float | tuple[float, None] | tuple[float, float] | None) -> None:
+        logger.debug("Setting timeouts: %r", timeout)
         if timeout is None:
             return
         if isinstance(timeout, (int, float)):
             connect_timeout = int(timeout * 1000)
             receive_timeout = int(timeout * 1000)
         elif isinstance(timeout, tuple):
-            if len(timeout) == 2:
+            if len(timeout) == TWO:
                 connect_timeout = int(timeout[0] * 1000) if timeout[0] is not None else 0
                 receive_timeout = int(timeout[1] * 1000) if timeout[1] is not None else 0
-            elif len(timeout) == 1:
+            elif len(timeout) == ONE:
                 connect_timeout = int(timeout[0] * 1000)
                 receive_timeout = int(timeout[0] * 1000)
             else:
@@ -184,13 +203,23 @@ class WinINetAdapter(BaseAdapter):
         else:
             return
         if connect_timeout:
-            wininet.InternetSetOptionW(handle, 2, ctypes.byref(ctypes.c_int(connect_timeout)), ctypes.sizeof(ctypes.c_int))
+            wininet.InternetSetOptionW(
+                handle,
+                INTERNET_OPTION_CONNECT_TIMEOUT,
+                ctypes.byref(ctypes.c_int(connect_timeout)),
+                ctypes.sizeof(ctypes.c_int),
+            )
         if receive_timeout:
-            wininet.InternetSetOptionW(handle, 6, ctypes.byref(ctypes.c_int(receive_timeout)), ctypes.sizeof(ctypes.c_int))
+            wininet.InternetSetOptionW(
+                handle,
+                INTERNET_OPTION_RECEIVE_TIMEOUT,
+                ctypes.byref(ctypes.c_int(receive_timeout)),
+                ctypes.sizeof(ctypes.c_int),
+            )
 
-    def _open_request(self, hConnect, method, path, flags):
-        hRequest = wininet.HttpOpenRequestW(
-            hConnect,
+    def _open_request(self, h_connect: int, method: str, path: str, flags: int) -> int:
+        h_request = wininet.HttpOpenRequestW(
+            h_connect,
             method,
             path,
             None,
@@ -199,54 +228,145 @@ class WinINetAdapter(BaseAdapter):
             flags,
             0,
         )
-        if not hRequest:
+        if not h_request:
             errno = kernel32.GetLastError()
-            wininet.InternetCloseHandle(hConnect)
-            raise requests.exceptions.ConnectionError(f"HttpOpenRequestW failed: {errno}")
-        return hRequest
+            wininet.InternetCloseHandle(h_connect)
+            msg = f"HttpOpenRequestW failed: {errno}"
+            raise requests.exceptions.ConnectionError(msg)
+        return h_request
 
-    def _send_request(self, hRequest, headers, body, body_len, hConnect, hInternet):
-        if not wininet.HttpSendRequestW(hRequest, headers, len(headers), body, body_len):
-            return self._handle_send_failure(hRequest, hConnect, hInternet, headers, body, hConnect, hInternet)
-        return
+    def _send_request(self, handles: RequestHandles, headers: str, body: bytes | None, body_len: int) -> None:
+        if not wininet.HttpSendRequestW(handles.h_request, headers, len(headers), body, body_len):
+            self._handle_send_failure(handles, headers, body)
 
-    def _handle_send_failure(self, hRequest, method, path, req_headers, send_data, hConnect, hInternet):
+    def _handle_send_failure(self, handles: RequestHandles, req_headers: str, send_data: bytes | None) -> None:
         error = kernel32.GetLastError()
         if error == ERROR_INTERNET_CLIENT_AUTH_CERT_NEEDED:
-            logger.warning(
-                f"Error 12044 (client certificate required) for {method} {path}. Prompting user with InternetErrorDlg."
-            )
-            dlg_result = wininet.InternetErrorDlg(self._hWnd, hRequest, error, FLAGS_IE_DIALOG, None)
+            logger.warning("Error 12044 (client certificate required) for request. Prompting user with InternetErrorDlg.")
+            dlg_result = wininet.InternetErrorDlg(self._hwnd, handles.h_request, error, FLAGS_IE_DIALOG, None)
             if dlg_result == 0:
                 try:
-                    return self._send_request(
-                        hRequest, req_headers, send_data, len(send_data) if send_data else 0, hConnect, hInternet
-                    )
+                    self._send_request(handles, req_headers, send_data, len(send_data) if send_data else 0)
+                    return
                 except requests.exceptions.SSLError:
-                    logger.error(f"Failed to send request after user dialog for {method} {path}.")
+                    logger.exception("Failed to send request after user dialog.")
                     raise
-            logger.error(f"User did not select a certificate or dialog failed for {method} {path}.")
-            raise requests.exceptions.SSLError(f"Client certificate required for {method} {path}, but none was provided.")
-        else:
-            raise requests.exceptions.ConnectionError(f"Failed to send request for {method} {path}. WinINet error: {error}")
+            logger.error("User did not select a certificate or dialog failed.")
+            msg = "Client certificate required, but none was provided."
+            raise requests.exceptions.SSLError(msg)
+        msg = f"Failed to send request. WinINet error: {error}"
+        raise requests.exceptions.ConnectionError(msg)
 
-    def _open_connection(self, hInternet, host, port):
-        hConnect = wininet.InternetConnectW(hInternet, host, port, None, None, 3, 0, 0)
-        if not hConnect:
+    def _open_connection(self, h_internet: int, host: str, port: int) -> int:
+        h_connect = wininet.InternetConnectW(h_internet, host, port, None, None, INTERNET_SERVICE_HTTP, 0, 0)
+        if not h_connect:
             errno = kernel32.GetLastError()
-            wininet.InternetCloseHandle(hInternet)
-            raise requests.exceptions.ConnectionError(f"InternetConnectW failed: {errno}")
-        return hConnect
+            wininet.InternetCloseHandle(h_internet)
+            msg = f"InternetConnectW failed: {errno}"
+            raise requests.exceptions.ConnectionError(msg)
+        return h_connect
 
-    def _open_internet(self, timeout):
-        hInternet = wininet.InternetOpenW("PythonWinINetAdapter", INTERNET_OPEN_TYPE_PRECONFIG, None, None, 0)
-        if not hInternet:
+    def _open_internet(self, timeout: float | tuple[float, None] | tuple[float, float] | None) -> int:
+        h_internet = wininet.InternetOpenW("PythonWinINetAdapter", INTERNET_OPEN_TYPE_PRECONFIG, None, None, 0)
+        if not h_internet:
             errno = kernel32.GetLastError()
-            raise requests.exceptions.ConnectionError(f"InternetOpenW failed: {errno}")
-        self._set_timeouts(hInternet, timeout)
-        return hInternet
+            msg = f"InternetOpenW failed: {errno}"
+            raise requests.exceptions.ConnectionError(msg)
+        self._set_timeouts(h_internet, timeout)
+        return h_internet
 
-    def _build_response(self, request, status_code, reason, parsed_headers, content, stream, generate_content):
+    def send(
+        self,
+        request: PreparedRequest,
+        stream: bool = False,
+        timeout: float | tuple[float, None] | tuple[float, float] | None = None,
+        verify: bool | str = True,
+        cert=None,
+        proxies=None,
+    ) -> Response:
+        """Send a request using the WinINet adapter.
+
+        :param request: The request to send.
+        :param stream: Whether to stream the response.
+        :param timeout: The timeout for the request.
+        :param verify: Whether to verify SSL certificates.
+        :param cert: Client certificate for SSL authentication.
+        :param proxies: Proxies to use for the request.
+        :return: The response from the server.
+        """
+        logger.debug("Preparing %s %s", request.method, request.url)
+        url = urllib.parse.urlparse(request.url)
+        host = str(url.hostname or "")
+        port = url.port or (443 if url.scheme == "https" else 80)
+        path = str(url.path or "/")
+        if url.query:
+            path = path + "?" + str(url.query)
+        is_https = url.scheme == "https"
+        logger.debug("Connecting to %s:%d (HTTPS=%r)", host, port, is_https)
+        h_internet = self._open_internet(timeout)
+        h_connect = self._open_connection(h_internet, host, port)
+        method = request.method or "GET"
+        flags = INTERNET_FLAG_RELOAD | INTERNET_FLAG_NO_CACHE_WRITE
+        if is_https:
+            flags |= INTERNET_FLAG_SECURE
+        logger.debug("HttpOpenRequestW: method=%s, path=%s, flags=%d", method, path, flags)
+        h_request = self._open_request(h_connect, method, path, flags)
+        handles = RequestHandles(h_request, h_connect, h_internet)
+        headers = self._prepare_headers(request)
+        body, body_len = self._prepare_body(request)
+        logger.debug("Sending headers: %r", headers)
+        if body is not None:
+            logger.debug("Sending body of length: %d", body_len)
+        self._send_request(handles, headers, body, body_len)
+        logger.debug("HttpSendRequestW sent")
+        status_code = self._get_status_code(h_request)
+        reason = self._parse_reason(h_request)
+        parsed_headers = self._parse_headers(h_request)
+        logger.debug("Status code: %r", status_code)
+        logger.debug("Reason: %r", reason)
+        logger.debug("Parsed headers: %r", parsed_headers)
+        content = self._read_content(h_request)
+        logger.debug("Read %d bytes from response", len(content))
+        transfer_encoding = parsed_headers.get("Transfer-Encoding", "").lower()
+        content_encoding = parsed_headers.get("Content-Encoding", "").lower()
+        content = self._decode_content(content, transfer_encoding, content_encoding)
+        wininet.InternetCloseHandle(h_request)
+        wininet.InternetCloseHandle(h_connect)
+        wininet.InternetCloseHandle(h_internet)
+
+        def generate_content() -> Generator[bytes, None, None]:
+            logger.debug("Starting streaming response generator")
+            h_internet = self._open_internet(timeout)
+            h_connect = self._open_connection(h_internet, host, port)
+            h_request = self._open_request(h_connect, method, path, flags)
+            handles = RequestHandles(h_request, h_connect, h_internet)
+            self._send_request(handles, headers, body, body_len)
+            try:
+                buffer = ctypes.create_string_buffer(CHUNK_SIZE)
+                bytes_read = wintypes.DWORD(0)
+                while True:
+                    success = wininet.InternetReadFile(h_request, buffer, CHUNK_SIZE, ctypes.byref(bytes_read))
+                    if not success or bytes_read.value == 0:
+                        break
+                    yield buffer.raw[: bytes_read.value]
+            finally:
+                wininet.InternetCloseHandle(h_request)
+                wininet.InternetCloseHandle(h_connect)
+                wininet.InternetCloseHandle(h_internet)
+            logger.debug("Streaming response generator finished")
+
+        return self._build_response(request, status_code, reason, parsed_headers, content, stream, generate_content)
+
+    def _build_response(
+        self,
+        request: PreparedRequest,
+        status_code: int,
+        reason: str,
+        parsed_headers: dict,
+        content: bytes,
+        stream: bool,
+        generate_content: Callable[[], Generator[bytes, None, None]],
+    ) -> Response:
         response = Response()
         response.status_code = status_code or 200
         response.url = str(request.url) if request.url is not None else ""
@@ -255,107 +375,39 @@ class WinINetAdapter(BaseAdapter):
         response.reason = reason or "OK"
         response.encoding = None
         if stream:
-            response._content = None
+            response._content = content if content else b""
             response.raw = generate_content()
         else:
             response._content = content
             response.raw = None
         logger.debug(
-            f"Returning response: status={response.status_code}, reason={response.reason}, headers={dict(response.headers)}"
+            "Returning response: status=%r, reason=%r, headers=%r",
+            response.status_code,
+            response.reason,
+            dict(response.headers),
         )
         return response
 
-    def _decode_content(self, content, transfer_encoding, content_encoding):
+    def _decode_content(self, content: bytes, transfer_encoding: str, content_encoding: str) -> bytes:
         """Decompress and/or dechunk content as needed."""
         if content_encoding == "gzip":
             try:
                 content = gzip.decompress(content)
                 logger.debug("Decompressed gzip response")
-            except Exception as e:
-                logger.warning(f"Failed to decompress gzip: {e}")
+            except OSError as e:
+                logger.warning("Failed to decompress gzip: %r", e)
         elif content_encoding == "deflate":
             try:
                 content = zlib.decompress(content)
                 logger.debug("Decompressed deflate response")
-            except Exception as e:
-                logger.warning(f"Failed to decompress deflate: {e}")
-        elif "chunked" in transfer_encoding:
+            except zlib.error as e:
+                logger.warning("Failed to decompress deflate: %r", e)
+        elif CHUNKED_ENCODING in transfer_encoding:
             content = self._dechunk(content)
-            logger.debug(f"Dechunked response to {len(content)} bytes")
+            logger.debug("Dechunked response to %d bytes", len(content))
         return content
 
-    def send(
-        self,
-        request: PreparedRequest,
-        stream: bool = False,
-        timeout: float | Tuple[float, None] | Tuple[float, float] | None = None,
-        verify=True,
-        cert=None,
-        proxies=None,
-    ):
-        logger.debug(f"Preparing {request.method} {request.url}")
-        url = urllib.parse.urlparse(request.url)
-        host = url.hostname
-        port = url.port or (443 if url.scheme == "https" else 80)
-        path = url.path or "/"
-        if url.query:
-            if not isinstance(path, str):
-                path = str(path)
-            path = path + "?" + str(url.query)
-        is_https = url.scheme == "https"
-        logger.debug(f"Connecting to {host}:{port} (HTTPS={is_https})")
-        hInternet = self._open_internet(timeout)
-        hConnect = self._open_connection(hInternet, host, port)
-        method = request.method or "GET"
-        flags = INTERNET_FLAG_RELOAD | INTERNET_FLAG_NO_CACHE_WRITE
-        if is_https:
-            flags |= 0x00800000  # INTERNET_FLAG_SECURE
-        logger.debug(f"HttpOpenRequestW: method={method}, path={path}, flags={flags}")
-        hRequest = self._open_request(hConnect, method, path, flags)
-        headers = self._prepare_headers(request)
-        body, body_len = self._prepare_body(request)
-        logger.debug(f"Sending headers: {headers!r}")
-        if body is not None:
-            logger.debug(f"Sending body of length: {body_len}")
-        self._send_request(hRequest, headers, body, body_len, hConnect, hInternet)
-        logger.debug("HttpSendRequestW sent")
-        status_code = self._get_status_code(hRequest)
-        reason = self._parse_reason(hRequest)
-        parsed_headers = self._parse_headers(hRequest)
-        logger.debug(f"Status code: {status_code}")
-        logger.debug(f"Reason: {reason}")
-        logger.debug(f"Parsed headers: {parsed_headers}")
-        content = self._read_content(hRequest)
-        logger.debug(f"Read {len(content)} bytes from response")
-        transfer_encoding = parsed_headers.get("Transfer-Encoding", "").lower()
-        content_encoding = parsed_headers.get("Content-Encoding", "").lower()
-        content = self._decode_content(content, transfer_encoding, content_encoding)
-        wininet.InternetCloseHandle(hRequest)
-        wininet.InternetCloseHandle(hConnect)
-        wininet.InternetCloseHandle(hInternet)
-
-        def generate_content():
-            logger.debug("Starting streaming response generator")
-            hInternet = self._open_internet(timeout)
-            hConnect = self._open_connection(hInternet, host, port)
-            hRequest = self._open_request(hConnect, method, path, flags)
-            self._send_request(hRequest, headers, body, body_len, hConnect, hInternet)
-            try:
-                buffer = ctypes.create_string_buffer(4096)
-                bytes_read = wintypes.DWORD(0)
-                while True:
-                    success = wininet.InternetReadFile(hRequest, buffer, 4096, ctypes.byref(bytes_read))
-                    if not success or bytes_read.value == 0:
-                        break
-                    yield buffer.raw[: bytes_read.value]
-            finally:
-                wininet.InternetCloseHandle(hRequest)
-                wininet.InternetCloseHandle(hConnect)
-                wininet.InternetCloseHandle(hInternet)
-            logger.debug("Streaming response generator finished")
-
-        return self._build_response(request, status_code, reason, parsed_headers, content, stream, generate_content)
-
-    def close(self):
+    def close(self) -> None:
+        """Close the adapter and clean up resources."""
         # No persistent resources to clean up
-        pass
+        return
