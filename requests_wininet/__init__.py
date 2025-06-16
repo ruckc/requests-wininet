@@ -20,7 +20,7 @@ from requests.structures import CaseInsensitiveDict
 if TYPE_CHECKING:
     from collections.abc import Callable, Generator
 
-# Constants for WinINet
+# Constants for WinINet and CryptoAPI
 INTERNET_OPEN_TYPE_PRECONFIG = 0
 INTERNET_FLAG_RELOAD = 0x80000000
 INTERNET_FLAG_NO_CACHE_WRITE = 0x04000000
@@ -28,6 +28,7 @@ INTERNET_FLAG_SECURE = 0x00800000
 INTERNET_SERVICE_HTTP = 3
 INTERNET_OPTION_CONNECT_TIMEOUT = 2
 INTERNET_OPTION_RECEIVE_TIMEOUT = 6
+INTERNET_OPTION_CLIENT_CERT_CONTEXT = 84
 HTTP_QUERY_STATUS_CODE = 19
 HTTP_QUERY_RAW_HEADERS_CRLF = 22
 HTTP_QUERY_STATUS_TEXT = 20
@@ -41,6 +42,12 @@ INTERNET_ERROR_BASE = 12000
 ERROR_INTERNET_CLIENT_AUTH_CERT_NEEDED = 12044
 FLAGS_IE_DIALOG = 0x00000001
 
+CERT_STORE_PROV_SYSTEM = 10
+CERT_SYSTEM_STORE_CURRENT_USER = "CurrentUser"
+CERT_FIND_HASH = 2
+X509_ASN_ENCODING = 0x00000001
+
+crypt32 = ctypes.windll.crypt32
 wininet = ctypes.windll.wininet
 kernel32 = ctypes.windll.kernel32
 
@@ -310,13 +317,39 @@ class WinINetAdapter(BaseAdapter):
         content = self._read_content(h_request)
         return status_code, reason, parsed_headers, content
 
+    def _find_cert_context_by_thumbprint(self, thumbprint: str) -> ctypes.c_void_p | None:
+        import binascii
+
+        # Open the current user's personal certificate store
+        store = crypt32.CertOpenStore(CERT_STORE_PROV_SYSTEM, 0, 0, CERT_SYSTEM_STORE_CURRENT_USER, "MY")
+        if not store:
+            logger.error("Could not open certificate store.")
+            return None
+        # Convert thumbprint to bytes
+        thumbprint_bytes = binascii.unhexlify(thumbprint.replace(":", "").replace(" ", "").lower())
+
+        class CryptHashBlob(ctypes.Structure):
+            _fields_ = [("cbData", wintypes.DWORD), ("pbData", ctypes.POINTER(ctypes.c_ubyte))]
+
+        hash_blob = CryptHashBlob(
+            len(thumbprint_bytes), (ctypes.c_ubyte * len(thumbprint_bytes)).from_buffer_copy(thumbprint_bytes)
+        )
+        cert_ctx = crypt32.CertFindCertificateInStore(
+            store, X509_ASN_ENCODING, 0, CERT_FIND_HASH, ctypes.byref(hash_blob), None
+        )
+        crypt32.CertCloseStore(store, 0)
+        if not cert_ctx:
+            logger.error("Certificate with thumbprint %s not found.", thumbprint)
+            return None
+        return cert_ctx
+
     def send(  # noqa: PLR0913
         self,
         request: PreparedRequest,
         stream: bool = False,  # noqa: FBT001,FBT002
         timeout: float | tuple[float, None] | tuple[float, float] | None = None,
         verify: bool | str = True,  # noqa: FBT002,ARG002
-        cert: object = None,  # noqa: ARG002
+        cert: object = None,
         proxies: object = None,  # noqa: ARG002
     ) -> Response:
         """Send a request using the WinINet adapter.
@@ -331,6 +364,22 @@ class WinINetAdapter(BaseAdapter):
         """
         logger.debug("Preparing %s %s", request.method, request.url)
         handles, headers, body, body_len, host, path, method, flags, port = self._setup_handles(request, timeout)
+        # Preemptively set client certificate if cert param is a thumbprint string
+        if cert and isinstance(cert, str) and request.url and request.url.lower().startswith("https"):
+            cert_ctx = self._find_cert_context_by_thumbprint(cert)
+            if cert_ctx:
+                # Set the client cert context on the request handle
+                if not wininet.InternetSetOptionW(
+                    handles.h_request,
+                    INTERNET_OPTION_CLIENT_CERT_CONTEXT,
+                    cert_ctx,
+                    ctypes.sizeof(ctypes.c_void_p),
+                ):
+                    logger.error("Failed to set client certificate context for thumbprint %s", cert)
+                else:
+                    logger.info("Set client certificate context for thumbprint %s", cert)
+            else:
+                logger.error("Could not find or set client certificate for thumbprint %s", cert)
         logger.debug("Connecting to %s:%d (HTTPS=%r)", host, port, request.url and "https" in request.url)
         logger.debug("HttpOpenRequestW: method=%s, path=%s, flags=%d", method, path, flags)
         logger.debug("Sending headers: %r", headers)

@@ -1,6 +1,6 @@
 [project]
 name = "requests-wininet"
-version = "0.1.5"
+version = "0.1.6"
 description = "Implements Window's WinINet API for python requests"
 authors = [{ name = "Curtis Ruck" }]
 readme = "README.md"
