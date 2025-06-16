@@ -8,15 +8,17 @@ import gzip
 import logging
 import urllib.parse
 import zlib
-from collections.abc import Generator
 from ctypes import wintypes
 from dataclasses import dataclass
-from typing import Callable
+from typing import TYPE_CHECKING
 
 import requests
 from requests.adapters import BaseAdapter
 from requests.models import PreparedRequest, Response
 from requests.structures import CaseInsensitiveDict
+
+if TYPE_CHECKING:
+    from collections.abc import Callable, Generator
 
 # Constants for WinINet
 INTERNET_OPEN_TYPE_PRECONFIG = 0
@@ -81,8 +83,9 @@ class WinINetAdapter(BaseAdapter):
             try:
                 return int(buf.value)
             except ValueError:
-                pass
-        return 0
+                return 0
+        else:
+            return 0
 
     def _prepare_headers(self, request: PreparedRequest) -> str:
         headers = ""
@@ -247,15 +250,16 @@ class WinINetAdapter(BaseAdapter):
             if dlg_result == 0:
                 try:
                     self._send_request(handles, req_headers, send_data, len(send_data) if send_data else 0)
-                    return
                 except requests.exceptions.SSLError:
                     logger.exception("Failed to send request after user dialog.")
                     raise
-            logger.error("User did not select a certificate or dialog failed.")
-            msg = "Client certificate required, but none was provided."
-            raise requests.exceptions.SSLError(msg)
-        msg = f"Failed to send request. WinINet error: {error}"
-        raise requests.exceptions.ConnectionError(msg)
+            else:
+                logger.error("User did not select a certificate or dialog failed.")
+                msg = "Client certificate required, but none was provided."
+                raise requests.exceptions.SSLError(msg)
+        else:
+            msg = f"Failed to send request. WinINet error: {error}"
+            raise requests.exceptions.ConnectionError(msg)
 
     def _open_connection(self, h_internet: int, host: str, port: int) -> int:
         h_connect = wininet.InternetConnectW(h_internet, host, port, None, None, INTERNET_SERVICE_HTTP, 0, 0)
@@ -275,14 +279,45 @@ class WinINetAdapter(BaseAdapter):
         self._set_timeouts(h_internet, timeout)
         return h_internet
 
-    def send(
+    def _setup_handles(
         self,
         request: PreparedRequest,
-        stream: bool = False,
+        timeout: float | tuple[float, None] | tuple[float, float] | None,
+    ) -> tuple[RequestHandles, str, bytes | None, int, str, str, str, int, int]:
+        url = urllib.parse.urlparse(request.url)
+        host = str(url.hostname or "")
+        port = url.port or (443 if url.scheme == "https" else 80)
+        path = str(url.path or "/")
+        if url.query:
+            path = path + "?" + str(url.query)
+        is_https = url.scheme == "https"
+        h_internet = self._open_internet(timeout)
+        h_connect = self._open_connection(h_internet, host, port)
+        method = request.method or "GET"
+        flags = INTERNET_FLAG_RELOAD | INTERNET_FLAG_NO_CACHE_WRITE
+        if is_https:
+            flags |= INTERNET_FLAG_SECURE
+        h_request = self._open_request(h_connect, method, path, flags)
+        handles = RequestHandles(h_request, h_connect, h_internet)
+        headers = self._prepare_headers(request)
+        body, body_len = self._prepare_body(request)
+        return handles, headers, body, body_len, host, path, method, flags, port
+
+    def _parse_response(self, h_request: int) -> tuple[int, str, dict, bytes]:
+        status_code = self._get_status_code(h_request)
+        reason = self._parse_reason(h_request)
+        parsed_headers = self._parse_headers(h_request)
+        content = self._read_content(h_request)
+        return status_code, reason, parsed_headers, content
+
+    def send(  # noqa: PLR0913
+        self,
+        request: PreparedRequest,
+        stream: bool = False,  # noqa: FBT001,FBT002
         timeout: float | tuple[float, None] | tuple[float, float] | None = None,
-        verify: bool | str = True,
-        cert=None,
-        proxies=None,
+        verify: bool | str = True,  # noqa: FBT002,ARG002
+        cert: object = None,  # noqa: ARG002
+        proxies: object = None,  # noqa: ARG002
     ) -> Response:
         """Send a request using the WinINet adapter.
 
@@ -295,52 +330,32 @@ class WinINetAdapter(BaseAdapter):
         :return: The response from the server.
         """
         logger.debug("Preparing %s %s", request.method, request.url)
-        url = urllib.parse.urlparse(request.url)
-        host = str(url.hostname or "")
-        port = url.port or (443 if url.scheme == "https" else 80)
-        path = str(url.path or "/")
-        if url.query:
-            path = path + "?" + str(url.query)
-        is_https = url.scheme == "https"
-        logger.debug("Connecting to %s:%d (HTTPS=%r)", host, port, is_https)
-        h_internet = self._open_internet(timeout)
-        h_connect = self._open_connection(h_internet, host, port)
-        method = request.method or "GET"
-        flags = INTERNET_FLAG_RELOAD | INTERNET_FLAG_NO_CACHE_WRITE
-        if is_https:
-            flags |= INTERNET_FLAG_SECURE
+        handles, headers, body, body_len, host, path, method, flags, port = self._setup_handles(request, timeout)
+        logger.debug("Connecting to %s:%d (HTTPS=%r)", host, port, request.url and "https" in request.url)
         logger.debug("HttpOpenRequestW: method=%s, path=%s, flags=%d", method, path, flags)
-        h_request = self._open_request(h_connect, method, path, flags)
-        handles = RequestHandles(h_request, h_connect, h_internet)
-        headers = self._prepare_headers(request)
-        body, body_len = self._prepare_body(request)
         logger.debug("Sending headers: %r", headers)
         if body is not None:
             logger.debug("Sending body of length: %d", body_len)
         self._send_request(handles, headers, body, body_len)
         logger.debug("HttpSendRequestW sent")
-        status_code = self._get_status_code(h_request)
-        reason = self._parse_reason(h_request)
-        parsed_headers = self._parse_headers(h_request)
+        status_code, reason, parsed_headers, content = self._parse_response(handles.h_request)
         logger.debug("Status code: %r", status_code)
         logger.debug("Reason: %r", reason)
         logger.debug("Parsed headers: %r", parsed_headers)
-        content = self._read_content(h_request)
-        logger.debug("Read %d bytes from response", len(content))
         transfer_encoding = parsed_headers.get("Transfer-Encoding", "").lower()
         content_encoding = parsed_headers.get("Content-Encoding", "").lower()
         content = self._decode_content(content, transfer_encoding, content_encoding)
-        wininet.InternetCloseHandle(h_request)
-        wininet.InternetCloseHandle(h_connect)
-        wininet.InternetCloseHandle(h_internet)
+        wininet.InternetCloseHandle(handles.h_request)
+        wininet.InternetCloseHandle(handles.h_connect)
+        wininet.InternetCloseHandle(handles.h_internet)
 
         def generate_content() -> Generator[bytes, None, None]:
             logger.debug("Starting streaming response generator")
             h_internet = self._open_internet(timeout)
             h_connect = self._open_connection(h_internet, host, port)
             h_request = self._open_request(h_connect, method, path, flags)
-            handles = RequestHandles(h_request, h_connect, h_internet)
-            self._send_request(handles, headers, body, body_len)
+            handles_stream = RequestHandles(h_request, h_connect, h_internet)
+            self._send_request(handles_stream, headers, body, body_len)
             try:
                 buffer = ctypes.create_string_buffer(CHUNK_SIZE)
                 bytes_read = wintypes.DWORD(0)
@@ -355,17 +370,26 @@ class WinINetAdapter(BaseAdapter):
                 wininet.InternetCloseHandle(h_internet)
             logger.debug("Streaming response generator finished")
 
-        return self._build_response(request, status_code, reason, parsed_headers, content, stream, generate_content)
+        return self._build_response(
+            request=request,
+            status_code=status_code,
+            reason=reason,
+            parsed_headers=parsed_headers,
+            content=content,
+            stream=stream,
+            generate_content=generate_content,
+        )
 
-    def _build_response(
+    def _build_response(  # noqa: PLR0913
         self,
         request: PreparedRequest,
         status_code: int,
         reason: str,
         parsed_headers: dict,
         content: bytes,
-        stream: bool,
-        generate_content: Callable[[], Generator[bytes, None, None]],
+        *,  # keyword-only arguments must follow
+        stream: bool = False,
+        generate_content: Callable[[], Generator[bytes, None, None]] | None = None,
     ) -> Response:
         response = Response()
         response.status_code = status_code or 200
@@ -375,10 +399,11 @@ class WinINetAdapter(BaseAdapter):
         response.reason = reason or "OK"
         response.encoding = None
         if stream:
-            response._content = content if content else b""
-            response.raw = generate_content()
+            # _content is private, but requests uses it internally. No public setter exists.
+            response._content = content if content else b""  # noqa: SLF001
+            response.raw = generate_content() if generate_content else None
         else:
-            response._content = content
+            response._content = content  # noqa: SLF001
             response.raw = None
         logger.debug(
             "Returning response: status=%r, reason=%r, headers=%r",
