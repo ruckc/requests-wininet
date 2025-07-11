@@ -6,6 +6,7 @@ from __future__ import annotations
 import contextlib
 import ctypes
 import logging
+from os import error
 import urllib.parse
 from ctypes import wintypes
 from dataclasses import dataclass
@@ -20,6 +21,70 @@ import requests
 from requests.adapters import BaseAdapter
 from requests.models import PreparedRequest, Response
 from requests.structures import CaseInsensitiveDict
+from urllib3.response import HTTPResponse
+from io import BytesIO
+
+class GeneratorWrapper:
+    """Wraps a generator to make it look like a file-like object for urllib3."""
+    
+    def __init__(self, generator):
+        self.generator = generator
+        self.buffer = b""
+        self.closed = False
+        
+    def read(self, size=-1):
+        if self.closed:
+            return b""
+            
+        if size == -1:
+            # Read all remaining data
+            chunks = [self.buffer]
+            self.buffer = b""
+            try:
+                for chunk in self.generator:
+                    chunks.append(chunk)
+                self.closed = True
+                return b"".join(chunks)
+            except StopIteration:
+                self.closed = True
+                return b"".join(chunks)
+        else:
+            # Read up to size bytes
+            while len(self.buffer) < size:
+                try:
+                    chunk = next(self.generator)
+                    self.buffer += chunk
+                except StopIteration:
+                    self.closed = True
+                    break
+            
+            if len(self.buffer) <= size:
+                result = self.buffer
+                self.buffer = b""
+                return result
+            else:
+                result = self.buffer[:size]
+                self.buffer = self.buffer[size:]
+                return result
+    
+    def readline(self, size=-1):
+        # Simple implementation for compatibility
+        return self.read(size)
+    
+    def close(self):
+        self.closed = True
+        
+    def __iter__(self):
+        return self
+        
+    def __next__(self):
+        if self.closed:
+            raise StopIteration
+        try:
+            return next(self.generator)
+        except StopIteration:
+            self.closed = True
+            raise
 
 # Constants for WinINet and CryptoAPI
 INTERNET_OPEN_TYPE_PRECONFIG = 0
@@ -339,19 +404,18 @@ class WinINetAdapter(BaseAdapter):
                         h_request,
                         INTERNET_OPTION_CLIENT_CERT_CONTEXT,
                         cert_ctx,
-                        ctypes.sizeof(ctypes.c_void_p),
+                        ctypes.sizeof(cert_ctx),
                     )
                 self._send_request(h_request, headers, body, body_len)
                 status_code = self._get_status_code(h_request)
                 reason = self._parse_reason(h_request)
                 parsed_headers = self._parse_headers(h_request)
                 content = self._read_content(h_request)
-                transfer_encoding = parsed_headers.get("Transfer-Encoding", "").lower()
-                # content_encoding = parsed_headers.get("Content-Encoding", "").lower()
-                content: bytes = self._decode_content(content, transfer_encoding)
+                # Let requests handle both transfer and content encoding
 
         def generate_content() -> Generator[bytes, None, None]:
             logger.debug("Starting streaming response generator")
+            # Raw data will be yielded - let requests handle content/transfer encoding
             with (
                 self.api.open_internet(timeout) as h_internet,
                 self.api.open_connection(h_internet, host, port) as h_connect,
@@ -395,10 +459,11 @@ class WinINetAdapter(BaseAdapter):
             ctypes.byref(buf),
             ctypes.byref(buf_size),
         )
+        err = self.api.kernel32.GetLastError()
         if res and buf.value:
             logger.debug("[%s] CERT_CONTEXT is set: 0x%x", label, buf.value)
         else:
-            logger.debug("[%s] CERT_CONTEXT is NOT set or query failed (res=%r)", label, res)
+            logger.debug("[%s] CERT_CONTEXT is NOT set or query failed (res=%r, %d)", label, res, err)
 
     def _handle_send_failure(self, h_request: int, req_headers: str, send_data: bytes | None) -> None:
         error = self.api.kernel32.GetLastError()
@@ -439,12 +504,36 @@ class WinINetAdapter(BaseAdapter):
         response.headers = CaseInsensitiveDict(parsed_headers)
         response.reason = reason or "OK"
         response.encoding = None
-        if stream:
-            response._content = content if content else b""  # noqa: SLF001
-            response.raw = generate_content() if generate_content else None
+        
+        # Create an HTTPResponse object that requests can use for content encoding handling
+        if stream and generate_content:
+            # For streaming, wrap the generator in a file-like object
+            wrapped_generator = GeneratorWrapper(generate_content())
+            response.raw = HTTPResponse(
+                body=wrapped_generator,
+                headers=parsed_headers,
+                status=status_code,
+                reason=reason,
+                preload_content=False,
+                decode_content=True,
+                original_response=None
+            )
+            # Mark as not consumed so requests will handle streaming properly
+            response.raw._body = None
         else:
-            response._content = content  # noqa: SLF001
-            response.raw = None
+            # For non-streaming, create an HTTPResponse with the content
+            response.raw = HTTPResponse(
+                body=BytesIO(content),
+                headers=parsed_headers,
+                status=status_code,
+                reason=reason,
+                preload_content=False,
+                decode_content=True,
+                original_response=None
+            )
+            # Mark as not consumed so requests will handle content encoding
+            response.raw._body = None
+        
         logger.debug(
             "Returning response: status=%r, reason=%r, headers=%r",
             response.status_code,
@@ -452,11 +541,3 @@ class WinINetAdapter(BaseAdapter):
             dict(response.headers),
         )
         return response
-
-    def _decode_content(self, content: bytes, transfer_encoding: str) -> bytes:
-        """Decompress and/or dechunk content as needed."""
-        # Handle chunked encoding
-        if transfer_encoding == CHUNKED_ENCODING:
-            content = self._dechunk(content)
-        # Add more content decoding (e.g., gzip, deflate) as needed
-        return content
